@@ -95,18 +95,13 @@ class _AudioTranscriptPageState extends State<AudioTranscriptPage> with TickerPr
   // ── Permission ──────────────────────────────────────────────────────
 
   Future<void> _requestPermission() async {
-    final status = await Permission.microphone.request();
-    if (status.isGranted) {
-      final available = await _speech.initialize(
-        onError: (e) => debugPrint('Speech error: ${e.errorMsg}'),
-        onStatus: _onSpeechStatus,
-      );
-      setState(() {
-        _state = available ? _PageState.ready : _PageState.permissionDenied;
-      });
-    } else {
-      setState(() => _state = _PageState.permissionDenied);
-    }
+    final available = await _speech.initialize(
+      onError: (e) => debugPrint('Speech error: ${e.errorMsg}'),
+      onStatus: _onSpeechStatus,
+    );
+    setState(() {
+      _state = available ? _PageState.ready : _PageState.permissionDenied;
+    });
   }
 
   // ── Auto-restart listener when speech engine stops on its own ───────
