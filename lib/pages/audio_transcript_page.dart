@@ -1,3 +1,5 @@
+import 'dart:io' show Platform;
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:permission_handler/permission_handler.dart';
@@ -138,7 +140,12 @@ class _AudioTranscriptPageState extends State<AudioTranscriptPage> with TickerPr
       onResult: _onSpeechResult,
       onSoundLevelChange: (level) {
         setState(() {
-          _soundLevel = level.clamp(-2, 10).toDouble();
+          // Android: -2 to 10 dB, iOS: -50 to 0 dB — normalize to 0.0–1.0
+          if (Platform.isIOS) {
+            _soundLevel = ((level + 50) / 50).clamp(0.0, 1.0);
+          } else {
+            _soundLevel = ((level + 2) / 12).clamp(0.0, 1.0);
+          }
           _waveform.add(_soundLevel);
           if (_waveform.length > 60) _waveform.removeAt(0);
         });
@@ -837,7 +844,7 @@ class _WaveformPainter extends CustomPainter {
     final centerY = size.height / 2;
 
     for (int i = 0; i < data.length; i++) {
-      final normalized = ((data[i] + 2) / 12).clamp(0.05, 1.0);
+      final normalized = data[i].clamp(0.05, 1.0);
       final barHeight = normalized * size.height * 0.8;
       final x = i * barWidth + barWidth / 2;
 
