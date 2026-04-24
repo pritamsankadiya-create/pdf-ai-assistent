@@ -1,9 +1,11 @@
+import 'dart:async';
 import 'dart:io' show Platform;
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:share_plus/share_plus.dart';
+import 'package:wakelock_plus/wakelock_plus.dart';
 import 'package:speech_to_text/speech_to_text.dart';
 import 'package:speech_to_text/speech_recognition_result.dart';
 
@@ -47,9 +49,9 @@ class _AudioTranscriptPageState extends State<AudioTranscriptPage> with TickerPr
   _PageState _state = _PageState.initial;
   String _liveText = '';
   final List<TranscriptSegment> _segments = [];
-  double _soundLevel = 0.0;
   final List<double> _waveform = [];
   String _errorMsg = '';
+  Timer? _waveformDecayTimer;
 
   DateTime? _recordingStartTime;
   Duration _pausedDuration = Duration.zero;
@@ -73,6 +75,8 @@ class _AudioTranscriptPageState extends State<AudioTranscriptPage> with TickerPr
 
   @override
   void dispose() {
+    _stopWaveformDecay();
+    WakelockPlus.disable();
     _pulseCtrl.dispose();
     _editController.dispose();
     _speech.stop();
@@ -106,17 +110,76 @@ class _AudioTranscriptPageState extends State<AudioTranscriptPage> with TickerPr
     });
   }
 
+  // ── Waveform decay — keeps bars alive during speech engine gaps ─────
+
+  void _startWaveformDecay() {
+    _waveformDecayTimer?.cancel();
+    _waveformDecayTimer = Timer.periodic(
+      const Duration(milliseconds: 100),
+      (_) {
+        if (_state != _PageState.recording || !mounted) {
+          _stopWaveformDecay();
+          return;
+        }
+        if (_waveform.isEmpty) return;
+        // Smoothly decay the last bar value so waveform fades instead of freezing
+        final lastVal = _waveform.last;
+        if (lastVal > 0.05) {
+          setState(() {
+            _waveform.add((lastVal * 0.7).clamp(0.02, 1.0));
+            if (_waveform.length > 60) _waveform.removeAt(0);
+          });
+        }
+      },
+    );
+  }
+
+  void _stopWaveformDecay() {
+    _waveformDecayTimer?.cancel();
+    _waveformDecayTimer = null;
+  }
+
   // ── Auto-restart listener when speech engine stops on its own ───────
+
+  int _restartAttempts = 0;
+  static const int _maxRestartAttempts = 5;
 
   void _onSpeechStatus(String status) {
     if (status == 'notListening' && _state == _PageState.recording) {
       // Speech engine stopped on its own (final result or silence timeout).
       // Restart listening to keep the session going.
-      Future.delayed(const Duration(milliseconds: 200), () {
-        if (_state == _PageState.recording && mounted) {
-          _listenSpeech();
-        }
-      });
+      _restartListening();
+    }
+  }
+
+  Future<void> _restartListening() async {
+    if (_state != _PageState.recording || !mounted) return;
+
+    if (_restartAttempts >= _maxRestartAttempts) {
+      // Too many consecutive failures — re-initialize the engine
+      _restartAttempts = 0;
+      await Future.delayed(const Duration(milliseconds: 500));
+      if (_state != _PageState.recording || !mounted) return;
+
+      final ok = await _speech.initialize(
+        onError: (e) => debugPrint('Speech error: ${e.errorMsg}'),
+        onStatus: _onSpeechStatus,
+      );
+      if (!ok || _state != _PageState.recording || !mounted) return;
+    }
+
+    // Back off slightly: 300ms base + 200ms per attempt
+    final delay = Duration(milliseconds: 300 + _restartAttempts * 200);
+    await Future.delayed(delay);
+    if (_state != _PageState.recording || !mounted) return;
+
+    try {
+      await _listenSpeech();
+      _restartAttempts = 0; // reset on success
+    } catch (e) {
+      debugPrint('Restart listen failed: $e');
+      _restartAttempts++;
+      _restartListening(); // retry with backoff
     }
   }
 
@@ -130,6 +193,9 @@ class _AudioTranscriptPageState extends State<AudioTranscriptPage> with TickerPr
     _pausedDuration = Duration.zero;
     _pauseStartTime = null;
     _isEditing = false;
+    _restartAttempts = 0;
+    WakelockPlus.enable();
+    _startWaveformDecay();
     setState(() => _state = _PageState.recording);
 
     await _listenSpeech();
@@ -140,13 +206,18 @@ class _AudioTranscriptPageState extends State<AudioTranscriptPage> with TickerPr
       onResult: _onSpeechResult,
       onSoundLevelChange: (level) {
         setState(() {
-          // Android: -2 to 10 dB, iOS: -50 to 0 dB — normalize to 0.0–1.0
+          final double normalized;
           if (Platform.isIOS) {
-            _soundLevel = ((level + 50) / 50).clamp(0.0, 1.0);
+            // iOS reports -50 to 0 dB, but speech sits in ~-35 to -5.
+            // Map that narrower range and apply a power curve for
+            // visible up/down movement.
+            final linear = ((level + 35) / 30).clamp(0.0, 1.0);
+            normalized = linear * linear; // emphasize louder peaks
           } else {
-            _soundLevel = ((level + 2) / 12).clamp(0.0, 1.0);
+            // Android: -2 to 10 dB
+            normalized = ((level + 2) / 12).clamp(0.0, 1.0);
           }
-          _waveform.add(_soundLevel);
+          _waveform.add(normalized);
           if (_waveform.length > 60) _waveform.removeAt(0);
         });
       },
@@ -177,6 +248,7 @@ class _AudioTranscriptPageState extends State<AudioTranscriptPage> with TickerPr
 
   Future<void> _pauseRecording() async {
     await _speech.stop();
+    _stopWaveformDecay();
     _pauseStartTime = DateTime.now();
     // Finalize any live text as a segment
     if (_liveText.isNotEmpty) {
@@ -194,6 +266,7 @@ class _AudioTranscriptPageState extends State<AudioTranscriptPage> with TickerPr
       _pausedDuration += DateTime.now().difference(_pauseStartTime!);
       _pauseStartTime = null;
     }
+    _startWaveformDecay();
     setState(() => _state = _PageState.recording);
     await _listenSpeech();
   }
@@ -202,12 +275,14 @@ class _AudioTranscriptPageState extends State<AudioTranscriptPage> with TickerPr
 
   Future<void> _stopRecording() async {
     await _speech.stop();
+    _stopWaveformDecay();
+    WakelockPlus.disable();
     if (_pauseStartTime != null) {
       _pausedDuration += DateTime.now().difference(_pauseStartTime!);
       _pauseStartTime = null;
     }
     setState(() {
-      if (_segments.isEmpty && _liveText.isNotEmpty) {
+      if (_liveText.isNotEmpty) {
         _segments.add(TranscriptSegment(
           timestamp: _currentElapsed,
           text: _liveText,
@@ -310,6 +385,7 @@ class _AudioTranscriptPageState extends State<AudioTranscriptPage> with TickerPr
       _recordingStartTime = null;
       _pausedDuration = Duration.zero;
       _pauseStartTime = null;
+      _restartAttempts = 0;
       _state = _PageState.ready;
     });
   }

@@ -46,6 +46,7 @@ dependencies:
   audio_waveforms: ^1.2.0
   http: ^1.2.2
   share_plus: ^10.0.0
+  wakelock_plus: ^1.2.8
 
 dev_dependencies:
   flutter_test:
